@@ -1,1 +1,0 @@
-This is a secret file content for testing secure transfer.
