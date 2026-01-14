@@ -18,8 +18,6 @@ import kotlin.concurrent.thread
 
 class FilesFragment : Fragment() {
 
-    private lateinit var etServerIp: EditText
-    private lateinit var btnRefresh: Button
     private lateinit var swipeRefresh: SwipeRefreshLayout
     private lateinit var recyclerView: RecyclerView
     private lateinit var adapter: FileAdapter
@@ -30,8 +28,6 @@ class FilesFragment : Fragment() {
     ): View? {
         val view = inflater.inflate(R.layout.fragment_files, container, false)
 
-        etServerIp = view.findViewById(R.id.etServerIp)
-        btnRefresh = view.findViewById(R.id.btnRefresh)
         swipeRefresh = view.findViewById(R.id.swipeRefresh)
         recyclerView = view.findViewById(R.id.recyclerView)
 
@@ -41,13 +37,12 @@ class FilesFragment : Fragment() {
         }
         recyclerView.adapter = adapter
 
-        btnRefresh.setOnClickListener {
-            refreshList()
-        }
-
         swipeRefresh.setOnRefreshListener {
             refreshList()
         }
+
+        // Auto-refresh on load
+        refreshList()
 
         // Hack for file exposure if FileProvider not fully set up
         val builder = StrictMode.VmPolicy.Builder()
@@ -57,21 +52,15 @@ class FilesFragment : Fragment() {
     }
 
     private fun refreshList() {
-        val rawIp = etServerIp.text.toString().trim()
-        if (rawIp.isEmpty()) {
-            swipeRefresh.isRefreshing = false
-            return
-        }
-
         swipeRefresh.isRefreshing = true
         thread {
             try {
-                val passHash = "ff2f12ec5c6a2e9ef6b61c958ed701c327469190a18075fd909ec2a9b42b94f2"
-                val parts = rawIp.split(":")
-                val host = parts[0]
-                val port = if (parts.size > 1) parts[1].toInt() else 9999
+                val host = SessionManager.serverIp
+                val port = SessionManager.serverPort
+                val username = SessionManager.username
+                val passHash = SessionManager.passwordHash
 
-                val files = NetworkManager.listFiles(host, port, "android_user", passHash)
+                val files = NetworkManager.listFiles(host, port, username, passHash)
                 
                 activity?.runOnUiThread {
                     adapter.updateList(files)
@@ -87,21 +76,18 @@ class FilesFragment : Fragment() {
     }
 
     private fun downloadAndOpen(filename: String) {
-        val rawIp = etServerIp.text.toString().trim()
-        if (rawIp.isEmpty()) return
-
         Toast.makeText(context, "Downloading $filename...", Toast.LENGTH_SHORT).show()
         
         thread {
             try {
-                val passHash = "ff2f12ec5c6a2e9ef6b61c958ed701c327469190a18075fd909ec2a9b42b94f2"
-                val parts = rawIp.split(":")
-                val host = parts[0]
-                val port = if (parts.size > 1) parts[1].toInt() else 9999
+                val host = SessionManager.serverIp
+                val port = SessionManager.serverPort
+                val username = SessionManager.username
+                val passHash = SessionManager.passwordHash
 
                 val destFile = File(requireContext().getExternalFilesDir(null), filename)
                 
-                val success = NetworkManager.downloadFile(host, port, "android_user", passHash, filename, destFile)
+                val success = NetworkManager.downloadFile(host, port, username, passHash, filename, destFile)
                 
                 activity?.runOnUiThread {
                     if (success) {

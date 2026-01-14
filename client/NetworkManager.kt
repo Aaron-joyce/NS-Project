@@ -10,6 +10,50 @@ object NetworkManager {
     private const val PRE_SHARED_KEY = "12345678901234567890123456789012" // 32 bytes for AES-256
     private const val ALGORITHM = "AES/CBC/PKCS5Padding"
 
+    fun login(host: String, port: Int, username: String, passwordHash: String): Boolean {
+        try {
+            val socket = Socket(host, port)
+            val outputStream = socket.getOutputStream()
+            val inputStream = socket.getInputStream()
+
+            val success = authenticate(socket, inputStream, outputStream, username, passwordHash)
+            socket.close()
+            return success
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return false
+        }
+    }
+
+    fun register(host: String, port: Int, username: String, passwordHash: String): String {
+        try {
+            val socket = Socket(host, port)
+            val outputStream = socket.getOutputStream()
+            val inputStream = socket.getInputStream()
+            
+            // --- HANDSHAKE ---
+            // Receive Nonce (16 bytes) - We receive it but don't need it for registration hashing in this simplified flow
+            val nonce = ByteArray(16)
+            inputStream.read(nonce)
+
+            // --- SEND REGISTER COMMAND ---
+            // Format: REGISTER|username|passwordHash
+            val msg = "REGISTER|$username|$passwordHash"
+            outputStream.write(msg.toByteArray(Charsets.UTF_8))
+            outputStream.flush()
+
+            // --- READ RESPONSE ---
+            val responseBuffer = ByteArray(1024)
+            val len = inputStream.read(responseBuffer)
+            val response = String(responseBuffer, 0, len, Charsets.UTF_8)
+            
+            socket.close()
+            return response // "REG_OK", "REG_FAIL_EXISTS", etc.
+        } catch (e: Exception) {
+            return "ERROR: ${e.message}"
+        }
+    }
+
     fun uploadFile(file: File, host: String, port: Int, username: String, passwordHash: String, remoteFilename: String) {
         try {
             val socket = Socket(host, port)

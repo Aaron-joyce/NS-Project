@@ -19,7 +19,6 @@ class UploadFragment : Fragment() {
     private lateinit var btnSelectFile: Button
     private lateinit var btnUpload: Button
     private lateinit var tvSelectedFile: TextView
-    private lateinit var etServerIp: EditText
     private lateinit var tvLog: TextView
 
     private var selectedFile: File? = null
@@ -34,7 +33,6 @@ class UploadFragment : Fragment() {
         btnSelectFile = view.findViewById(R.id.btnSelectFile)
         btnUpload = view.findViewById(R.id.btnUpload)
         tvSelectedFile = view.findViewById(R.id.tvSelectedFile)
-        etServerIp = view.findViewById(R.id.etServerIp)
         tvLog = view.findViewById(R.id.tvLog)
 
         btnSelectFile.setOnClickListener {
@@ -44,18 +42,16 @@ class UploadFragment : Fragment() {
         }
 
         btnUpload.setOnClickListener {
-            val rawIp = etServerIp.text.toString().trim()
-            if (selectedFile != null && rawIp.isNotEmpty()) {
-                log("Starting upload to $rawIp...")
+            if (selectedFile != null) {
+                val host = SessionManager.serverIp
+                val port = SessionManager.serverPort
+                val username = SessionManager.username
+                val passHash = SessionManager.passwordHash
+
+                log("Starting upload to $host...")
                 thread {
                     try {
-                        val passHash = "ff2f12ec5c6a2e9ef6b61c958ed701c327469190a18075fd909ec2a9b42b94f2" // SHA256 of "secure_password"
-                        
-                        val parts = rawIp.split(":")
-                        val host = parts[0]
-                        val port = if (parts.size > 1) parts[1].toInt() else 9999
-
-                        NetworkManager.uploadFile(selectedFile!!, host, port, "android_user", passHash, selectedFileName)
+                        NetworkManager.uploadFile(selectedFile!!, host, port, username, passHash, selectedFileName)
                         
                         activity?.runOnUiThread { log("Upload process finished (Check logs for success/fail)") }
                     } catch (e: Exception) {

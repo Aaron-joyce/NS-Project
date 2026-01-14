@@ -134,7 +134,7 @@ class SecureVaultServer:
             client_socket.sendall(nonce)
             logging.info("Sent Nonce.")
 
-            # 2. Receive Auth Data (Username|AuthToken)
+            # 2. Receive Auth Data (Username|AuthToken) OR Register Command (REGISTER|Username|PasswordHash)
             # Assuming max length for this message is 1024 bytes
             auth_data_bytes = client_socket.recv(1024)
             logging.info(f"DEBUG: Raw auth bytes received: {auth_data_bytes}")
@@ -145,6 +145,34 @@ class SecureVaultServer:
             if not auth_data:
                 logging.warning("Empty auth data received.")
                 return
+
+            # --- REGISTRATION HANDLING ---
+            if auth_data.startswith("REGISTER|"):
+                try:
+                    _, reg_username, reg_pass_hash = auth_data.split('|')
+                    
+                    # Insert into DB
+                    conn = sqlite3.connect(DB_NAME)
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (reg_username, reg_pass_hash))
+                        conn.commit()
+                        logging.info(f"Registered new user: {reg_username}")
+                        self.log_audit("USER_REGISTERED", f"User: {reg_username}, IP: {addr[0]}")
+                        client_socket.sendall(b"REG_OK")
+                    except sqlite3.IntegrityError:
+                        logging.warning(f"Registration failed: User {reg_username} already exists.")
+                        client_socket.sendall(b"REG_FAIL_EXISTS")
+                    finally:
+                        conn.close()
+                except ValueError:
+                    logging.error("Invalid registration format.")
+                    client_socket.sendall(b"REG_FAIL_FORMAT")
+                
+                # Close connection after registration attempt (Client should reconnect to login)
+                client_socket.close()
+                return
+            # -----------------------------
 
             try:
                 if '|' not in auth_data:
@@ -172,11 +200,6 @@ class SecureVaultServer:
 
             # Server Calculation: SHA256(UserPasswordHash + Nonce)
             # Note: UserPasswordHash is hex string in DB, Nonce is bytes. 
-            # Protocol: SHA256(UserPasswordHash(as hex string) + Nonce(bytes))?
-            # Or SHA256(UserPasswordHash(bytes) + Nonce(bytes))?
-            # Let's assume UserPasswordHash is treated as string bytes for simplicity in concatenation, 
-            # or usually, we decode the hex.
-            # Let's stick to: SHA256( hex_string_of_hash.encode() + nonce_bytes )
             
             expected_token_input = stored_pass_hash.encode('utf-8') + nonce
             expected_token = hashlib.sha256(expected_token_input).hexdigest()
@@ -199,10 +222,10 @@ class SecureVaultServer:
             if command_data == "UPLOAD":
                 self.handle_upload(client_socket, username)
             elif command_data == "LIST":
-                self.handle_list(client_socket)
+                self.handle_list(client_socket, username)
             elif command_data.startswith("DOWNLOAD|"):
                 _, filename = command_data.split('|', 1)
-                self.handle_download(client_socket, filename)
+                self.handle_download(client_socket, filename, username)
             else:
                 logging.error(f"Unknown command: {command_data}")
                 client_socket.sendall(b"ERROR_CMD")
@@ -255,8 +278,10 @@ class SecureVaultServer:
             # Integrity Check
             if self.verify_integrity(decrypted_data, original_file_hash):
                 # Save to disk
-                save_path = f"uploads/{filename}"
-                os.makedirs("uploads", exist_ok=True)
+                user_dir = os.path.join("uploads", username)
+                os.makedirs(user_dir, exist_ok=True)
+                save_path = os.path.join(user_dir, filename)
+                
                 with open(save_path, "wb") as f:
                     f.write(decrypted_data)
                 
@@ -271,39 +296,33 @@ class SecureVaultServer:
             logging.error(f"Upload error: {e}")
             client_socket.sendall(b"ERROR_UPLOAD")
 
-    def handle_list(self, client_socket):
+    def handle_list(self, client_socket, username):
         try:
-            if not os.path.exists("uploads"):
+            user_dir = os.path.join("uploads", username)
+            if not os.path.exists(user_dir):
                 client_socket.sendall(b"0")
                 return
 
-            files = [f for f in os.listdir("uploads") if os.path.isfile(os.path.join("uploads", f))]
+            files = [f for f in os.listdir(user_dir) if os.path.isfile(os.path.join(user_dir, f))]
             count = len(files)
             client_socket.sendall(f"{count}".encode('utf-8'))
             
-            # Protocol: Send count, wait for ack? Or just send list?
-            # Let's send list as "file1|file2|file3"
-            # If large list, might need chunking. Assuming small for demo.
             if count > 0:
-                # Wait for client to be ready to receive list? 
-                # Simplest: Just send it after a short pause or receive an ACK.
-                # Let's verify client logic. Client will read count, then read rest.
-                # To distinguish boundaries, let's use a delimiter for list.
-                # Or: Send Count -> Client receives -> Client sends "READY_LIST" -> Server sends Names.
-                
-                # Let's go with: Send Count (with newline for safety) -> Client readsLine
                 client_socket.sendall(b"\n") # Delimiter for count
                 
                 file_list_str = "|".join(files)
                 client_socket.sendall((file_list_str + "\n").encode('utf-8'))
                 
-            logging.info(f"Sent list of {count} files.")
+            logging.info(f"Sent list of {count} files for user {username}.")
         except Exception as e:
             logging.error(f"List error: {e}")
 
-    def handle_download(self, client_socket, filename):
+    def handle_download(self, client_socket, filename, username):
         try:
-            file_path = os.path.join("uploads", filename)
+            # Security: Prevent directory traversal
+            filename = os.path.basename(filename) 
+            user_dir = os.path.join("uploads", username)
+            file_path = os.path.join(user_dir, filename)
             if not os.path.exists(file_path):
                 logging.error(f"File not found: {filename}")
                 client_socket.sendall(b"ERROR_NOT_FOUND")
