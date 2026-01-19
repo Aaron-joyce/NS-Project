@@ -8,6 +8,9 @@ import logging
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
+from cryptography.hazmat.primitives import serialization, hashes
+import base64
 
 # Configure Logging
 logging.basicConfig(
@@ -19,15 +22,65 @@ logging.basicConfig(
 HOST = '0.0.0.0'
 PORT = 9999
 DB_NAME = 'secure_vault.db'
-# HARDCODED AES KEY (For Demonstration Only - DO NOT USE IN PRODUCTION)
-# Key must be 32 bytes for AES-256
-PRE_SHARED_KEY = b'12345678901234567890123456789012' 
+PRIVATE_KEY_FILE = 'server_private.pem'
+PUBLIC_KEY_FILE = 'server_public.pem'
+# Removed PRE_SHARED_KEY 
 
 class SecureVaultServer:
     def __init__(self, host, port):
         self.host = host
         self.port = port
+        self.load_or_generate_keys()
         self.init_db()
+
+    def load_or_generate_keys(self):
+        """Loads RSA keys from file or generates them if missing."""
+        if os.path.exists(PRIVATE_KEY_FILE) and os.path.exists(PUBLIC_KEY_FILE):
+             try:
+                 with open(PRIVATE_KEY_FILE, "rb") as key_file:
+                     self.private_key = serialization.load_pem_private_key(
+                         key_file.read(),
+                         password=None,
+                         backend=default_backend()
+                     )
+                 with open(PUBLIC_KEY_FILE, "rb") as key_file:
+                     self.public_key_bytes = key_file.read()
+                 logging.info("RSA Keys loaded successfully.")
+             except Exception as e:
+                 logging.error(f"Failed to load keys: {e}")
+                 # Fallback to generate
+                 self.generate_keys()
+        else:
+             self.generate_keys()
+
+    def generate_keys(self):
+        """Generates new RSA 2048-bit key pair."""
+        logging.info("Generating new RSA keys...")
+        self.private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        self.public_key = self.private_key.public_key()
+        
+        # Save Private
+        pem_private = self.private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        with open(PRIVATE_KEY_FILE, "wb") as f:
+            f.write(pem_private)
+            
+        # Save Public
+        self.public_key_bytes = self.public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        with open(PUBLIC_KEY_FILE, "wb") as f:
+            f.write(self.public_key_bytes)
+            
+        logging.info("RSA Keys generated and saved.")
 
     def init_db(self):
         """Initializes the SQLite database with users and audit logs."""
@@ -93,16 +146,16 @@ class SecureVaultServer:
             logging.error(f"DB Error: {e}")
             return None
 
-    def decrypt_file(self, encrypted_data):
+    def decrypt_file(self, encrypted_data, session_key):
         """
-        Decrypts AES-256-CBC encrypted data.
+        Decrypts AES-256-CBC encrypted data using the session key.
         Assumes the first 16 bytes are the IV.
         """
         try:
             iv = encrypted_data[:16]
             ciphertext = encrypted_data[16:]
             
-            cipher = Cipher(algorithms.AES(PRE_SHARED_KEY), modes.CBC(iv), backend=default_backend())
+            cipher = Cipher(algorithms.AES(session_key), modes.CBC(iv), backend=default_backend())
             decryptor = cipher.decryptor()
             padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
             
@@ -144,6 +197,12 @@ class SecureVaultServer:
             
             if not auth_data:
                 logging.warning("Empty auth data received.")
+                return
+
+            if auth_data == "GET_PUB_KEY":
+                client_socket.sendall(self.public_key_bytes)
+                logging.info(f"Sent public key to {addr}")
+                client_socket.close()
                 return
 
             # --- REGISTRATION HANDLING ---
@@ -219,13 +278,23 @@ class SecureVaultServer:
             command_data = client_socket.recv(1024).decode('utf-8').strip()
             logging.info(f"Command received: {command_data}")
             
+            
             if command_data == "UPLOAD":
                 self.handle_upload(client_socket, username)
             elif command_data == "LIST":
                 self.handle_list(client_socket, username)
             elif command_data.startswith("DOWNLOAD|"):
-                _, filename = command_data.split('|', 1)
-                self.handle_download(client_socket, filename, username)
+                try:
+                    parts = command_data.split('|')
+                    if len(parts) == 3:
+                         _, filename, encrypted_session_key_b64 = parts
+                         self.handle_download(client_socket, filename, username, encrypted_session_key_b64)
+                    else:
+                         # Backward compatibility or error
+                         logging.error("DOWNLOAD command missing session key")
+                         client_socket.sendall(b"ERROR_ARGS")
+                except Exception as e:
+                    client_socket.sendall(b"ERROR_ARGS")
             else:
                 logging.error(f"Unknown command: {command_data}")
                 client_socket.sendall(b"ERROR_CMD")
@@ -243,10 +312,19 @@ class SecureVaultServer:
             # --- STEP 3: SECURE HEADER ---
             
             # Receive Metadata: Filename|OriginalFileHash|EncryptedFileSize
-            header_data = client_socket.recv(4096).decode('utf-8').strip()
-            filename, original_file_hash, encrypted_file_size_str = header_data.split('|')
+            # Receive Metadata: Filename|OriginalFileHash|EncryptedFileSize|EncryptedSessionKeyBase64
+            header_data = client_socket.recv(8192).decode('utf-8').strip() # Increased buffer for longer header
+            filename, original_file_hash, encrypted_file_size_str, enc_session_key_b64 = header_data.split('|')
             encrypted_file_size = int(encrypted_file_size_str)
             
+            # Decrypt Session Key
+            encrypted_id = base64.b64decode(enc_session_key_b64)
+            session_key = self.decrypt_rsa(encrypted_id)
+            if not session_key:
+                 logging.error("Failed to decrypt session key.")
+                 client_socket.sendall(b"ERROR_KEY")
+                 return
+
             logging.info(f"Header Received: File={filename}, Size={encrypted_file_size}")
             client_socket.sendall(b"READY")
 
@@ -268,7 +346,7 @@ class SecureVaultServer:
                 return
 
             # Decrypt
-            decrypted_data = self.decrypt_file(received_data)
+            decrypted_data = self.decrypt_file(received_data, session_key)
             if decrypted_data is None:
                 logging.error("Decryption failed.")
                 self.log_audit("DECRYPTION_FAIL", f"File: {filename}")
@@ -317,7 +395,22 @@ class SecureVaultServer:
         except Exception as e:
             logging.error(f"List error: {e}")
 
-    def handle_download(self, client_socket, filename, username):
+    def decrypt_rsa(self, encrypted_data):
+        """Decrypts data using the server's private key."""
+        try:
+            return self.private_key.decrypt(
+                encrypted_data,
+                asym_padding.OAEP(
+                    mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+        except Exception as e:
+            logging.error(f"RSA Decryption failed: {e}")
+            return None
+
+    def handle_download(self, client_socket, filename, username, encrypted_session_key_b64):
         try:
             # Security: Prevent directory traversal
             filename = os.path.basename(filename) 
@@ -337,8 +430,16 @@ class SecureVaultServer:
             # Client: IV + Encrypted.
             # Server: IV + Encrypted.
             
+            # Decrypt Session Key
+            enc_session_key = base64.b64decode(encrypted_session_key_b64)
+            session_key = self.decrypt_rsa(enc_session_key)
+            if not session_key:
+                 logging.error("Failed to decrypt session key for download.")
+                 client_socket.sendall(b"ERROR_KEY")
+                 return
+
             iv = os.urandom(16)
-            cipher = Cipher(algorithms.AES(PRE_SHARED_KEY), modes.CBC(iv), backend=default_backend())
+            cipher = Cipher(algorithms.AES(session_key), modes.CBC(iv), backend=default_backend())
             encryptor = cipher.encryptor()
             
             padder = padding.PKCS7(128).padder()

@@ -1,14 +1,24 @@
 import java.io.*
 import java.net.Socket
+import java.security.KeyFactory
 import java.security.MessageDigest
+import java.security.PublicKey
+import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
 import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import javax.crypto.spec.OAEPParameterSpec
+import javax.crypto.spec.PSource
+import java.security.spec.MGF1ParameterSpec
 
 object NetworkManager {
 
-    private const val PRE_SHARED_KEY = "12345678901234567890123456789012" // 32 bytes for AES-256
-    private const val ALGORITHM = "AES/CBC/PKCS5Padding"
+    // private const val PRE_SHARED_KEY = "..." // REMOVED
+    private const val ALGORITHM_AES = "AES/CBC/PKCS5Padding"
+    private const val ALGORITHM_RSA = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding"
 
     fun login(host: String, port: Int, username: String, passwordHash: String): Boolean {
         try {
@@ -109,20 +119,34 @@ object NetworkManager {
             }
 
             // --- STEP 3: SECURE HEADER ---
+            
+            // 0. Get Server Public Key First (New Connection)
+            val serverPubKey = getServerPublicKey(host, port)
+            if (serverPubKey == null) {
+                println("Failed to get server public key")
+                socket.close()
+                return
+            }
+            
+            // 1. Generate AES Session Key
+            val sessionKey = generateSessionKey()
+            
+            // 2. Encrypt Session Key with RSA
+            val encryptedSessionKey = encryptSessionKey(sessionKey, serverPubKey)
 
-            // 1. Calculate Original File Hash
+            // 3. Calculate Original File Hash
             val originalFileHash = hashFile(file)
 
-            // 2. Encrypt File
-            val encryptedData = encryptFile(file)
+            // 4. Encrypt File with Session Key
+            val encryptedData = encryptFile(file, sessionKey)
             val encryptedFileSize = encryptedData.size
 
-            // 3. Send Metadata: Filename|OriginalFileHash|EncryptedFileSize
-            val header = "$remoteFilename|$originalFileHash|$encryptedFileSize"
+            // 5. Send Metadata: Filename|OriginalFileHash|EncryptedFileSize|EncryptedSessionKey
+            val header = "$remoteFilename|$originalFileHash|$encryptedFileSize|$encryptedSessionKey"
             outputStream.write(header.toByteArray(Charsets.UTF_8))
             outputStream.flush()
 
-            // 4. Wait for READY
+            // 6. Wait for READY
             val readyResponse = ByteArray(5) // "READY"
             inputStream.read(readyResponse)
             if (String(readyResponse, Charsets.UTF_8) != "READY") {
@@ -206,8 +230,20 @@ object NetworkManager {
                 return false
             }
 
-            // Send Command
-            val command = "DOWNLOAD|$filename"
+            // Get Public Key
+            val serverPubKey = getServerPublicKey(host, port)
+            if (serverPubKey == null) {
+                println("Failed to fetch public key")
+                socket.close()
+                return false
+            }
+            
+            // Gen Session Key
+            val sessionKey = generateSessionKey()
+            val encSessionKey = encryptSessionKey(sessionKey, serverPubKey)
+
+            // Send Command: DOWNLOAD|filename|encSessionKey
+            val command = "DOWNLOAD|$filename|$encSessionKey"
             outputStream.write(command.toByteArray(Charsets.UTF_8))
             outputStream.flush()
 
@@ -243,8 +279,8 @@ object NetworkManager {
             }
 
             // Decrypt
-            // Server encrypts: IV + Encrypted Data
-            val decrypted = decryptData(encryptedData)
+            // Server encrypts: IV + Encrypted Data using sessionKey
+            val decrypted = decryptData(encryptedData, sessionKey)
             
             if (decrypted != null) {
                 destFile.writeBytes(decrypted)
@@ -290,7 +326,7 @@ object NetworkManager {
         }
     }
     
-    private fun decryptData(encryptedData: ByteArray): ByteArray? {
+    private fun decryptData(encryptedData: ByteArray, sessionKey: SecretKey): ByteArray? {
         try {
             if (encryptedData.size < 16) return null
             
@@ -298,10 +334,10 @@ object NetworkManager {
             val ciphertext = encryptedData.copyOfRange(16, encryptedData.size)
             
             val ivSpec = IvParameterSpec(iv)
-            val keySpec = SecretKeySpec(PRE_SHARED_KEY.toByteArray(Charsets.UTF_8), "AES")
+            val ivSpec = IvParameterSpec(iv)
             
-            val cipher = Cipher.getInstance(ALGORITHM)
-            cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
+            val cipher = Cipher.getInstance(ALGORITHM_AES)
+            cipher.init(Cipher.DECRYPT_MODE, sessionKey, ivSpec)
             
             return cipher.doFinal(ciphertext)
         } catch (e: Exception) {
@@ -344,19 +380,94 @@ object NetworkManager {
         return hash.joinToString("") { "%02x".format(it) }
     }
 
-    // Helper: AES-256-CBC Encryption
-    private fun encryptFile(file: File): ByteArray {
+    // Helper: AES-256-CBC Encryption with dynamic key
+    private fun encryptFile(file: File, sessionKey: SecretKey): ByteArray {
         val fileBytes = file.readBytes()
         val iv = ByteArray(16).apply { java.util.Random().nextBytes(this) }
         val ivSpec = IvParameterSpec(iv)
-        val keySpec = SecretKeySpec(PRE_SHARED_KEY.toByteArray(Charsets.UTF_8), "AES")
-
-        val cipher = Cipher.getInstance(ALGORITHM)
-        cipher.init(Cipher.ENCRYPT_MODE, keySpec, ivSpec)
+        
+        val cipher = Cipher.getInstance(ALGORITHM_AES)
+        cipher.init(Cipher.ENCRYPT_MODE, sessionKey, ivSpec)
         
         val encrypted = cipher.doFinal(fileBytes)
         
         // Prepend IV to ciphertext
         return iv + encrypted
+    }
+
+    // Helper: Get Server Public Key
+    private fun getServerPublicKey(host: String, port: Int): PublicKey? {
+        try {
+            val socket = Socket(host, port)
+            val outputStream = socket.getOutputStream()
+            val inputStream = socket.getInputStream()
+            
+            // Read 16-byte Nonce (ignore it)
+            val nonce = ByteArray(16)
+            inputStream.read(nonce)
+            
+            // Send Command
+            val command = "GET_PUB_KEY"
+            outputStream.write(command.toByteArray(Charsets.UTF_8))
+            outputStream.flush()
+            
+            // Read Public Key Bytes
+            // We need to read until end because it's a raw PEM or DER transfer? 
+            // The server sends `self.public_key_bytes` which is PEM format.
+            // But Socket.read() might return partial. Let's read fully.
+            
+            val buffer = ByteArrayOutputStream()
+            val data = ByteArray(4096)
+            var nRead: Int
+            while (inputStream.read(data, 0, data.size).also { nRead = it } != -1) {
+                buffer.write(data, 0, nRead)
+            }
+            socket.close()
+            
+            val keyBytes = buffer.toByteArray()
+            if (keyBytes.isEmpty()) return null
+            
+            // Convert PEM to PublicKey object
+            // Java's X509EncodedKeySpec expects DER (binary), so we need to strip PEM headers if it's PEM.
+            // ... Actually server sends PEM.
+            
+            val keyString = String(keyBytes, Charsets.UTF_8)
+            val pemHeader = "-----BEGIN PUBLIC KEY-----"
+            val pemFooter = "-----END PUBLIC KEY-----"
+            
+            val pemContent = keyString
+                .replace(pemHeader, "")
+                .replace(pemFooter, "")
+                .replace("\\s".toRegex(), "") // Remove newlines
+                
+            val decoded = Base64.getDecoder().decode(pemContent)
+            val spec = X509EncodedKeySpec(decoded)
+            val kf = KeyFactory.getInstance("RSA")
+            return kf.generatePublic(spec)
+            
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return null
+        }
+    }
+
+    // Helper: Generate AES Session Key
+    private fun generateSessionKey(): SecretKey {
+        val keyGen = KeyGenerator.getInstance("AES")
+        keyGen.init(256)
+        return keyGen.generateKey()
+    }
+
+    // Helper: Encrypt Session Key with RSA
+    private fun encryptSessionKey(sessionKey: SecretKey, publicKey: PublicKey): String {
+        val cipher = Cipher.getInstance(ALGORITHM_RSA)
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey)
+        
+        // We use OAEP with SHA-256 MGF1 as defined in server:
+        // asym_padding.OAEP(mgf=asym_padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+        // In Java "RSA/ECB/OAEPWithSHA-256AndMGF1Padding" should work.
+        
+        val encryptedBytes = cipher.doFinal(sessionKey.encoded)
+        return Base64.getEncoder().encodeToString(encryptedBytes)
     }
 }

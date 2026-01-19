@@ -1,3 +1,5 @@
 venv/
 .venv/
 uploads/*
+
+server_private.pem
