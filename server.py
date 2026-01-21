@@ -24,7 +24,7 @@ PORT = 9999
 DB_NAME = 'secure_vault.db'
 PRIVATE_KEY_FILE = 'server_private.pem'
 PUBLIC_KEY_FILE = 'server_public.pem'
-# Removed PRE_SHARED_KEY 
+
 
 class SecureVaultServer:
     def __init__(self, host, port):
